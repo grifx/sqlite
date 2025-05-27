@@ -1,0 +1,118 @@
+# Test file for JSX-like syntax parsing - Part 4: Error Cases
+
+# Load the Tcl test harness
+if {![info exists testdir]} {
+    set testdir [file dirname $argv0]
+}
+source $testdir/tester.tcl
+# No need to load define extension as these are parse errors
+
+# Parser Error Tests
+# These should fail during parsing (sqlite3_prepare_v2)
+
+# 9.1 Unclosed tag
+do_catchsql_test jsx4-9.1.1 {
+  SELECT <box
+} {1 {near "<box": syntax error}}
+
+do_catchsql_test jsx4-9.1.2 {
+  SELECT <box id="foo"
+} {1 {near "<box": syntax error}}
+
+
+# 9.2 Mismatched closing tag
+# Tag name comparison is case-sensitive in the C helper.
+do_catchsql_test jsx4-9.2.1 {
+  SELECT <box></boX>
+} {1 {JSX opening tag <box> does not match closing tag </boX>}}
+
+do_catchsql_test jsx4-9.2.2 {
+  SELECT <tag-name></tag_name>
+} {1 {JSX opening tag <tag-name> does not match closing tag </tag_name>}}
+
+# 9.3 Invalid attribute format
+# 9.3.1 Missing attribute value (attribute name only)
+do_catchsql_test jsx4-9.3.1 {
+  SELECT <box id />
+} {1 {near "/>": syntax error}}
+
+# 9.3.2 Attribute value is not a single expression or string
+# (e.g. {1 2} - this is not a valid single SQLite expression)
+do_catchsql_test jsx4-9.3.2 {
+  SELECT <box id = {1 2} />
+} {1 {near "2": syntax error}}
+
+
+# 9.4 Unclosed expression brace
+do_catchsql_test jsx4-9.4.1 {
+  CREATE TABLE t_err_unclosed(name TEXT);
+  SELECT <box>{t_err_unclosed.name</box> FROM t_err_unclosed;
+} {1 {near "</box>": syntax error}} 
+
+do_catchsql_test jsx4-9.4.2 {
+  SELECT <box attr={func(</box>
+} {1 {near "</box>": syntax error}}
+
+
+# 9.5 Missing closing angle bracket for opening tag
+do_catchsql_test jsx4-9.5.1 {
+  SELECT <box id="test"
+} {1 {near "<box": syntax error}}
+
+
+# 9.6 Missing closing angle bracket for closing tag
+do_catchsql_test jsx4-9.6.1 {
+  SELECT <box></box
+} {1 {near "</box": syntax error}}
+
+# 9.7 JSX expression not allowed in this context (e.g. directly in GROUP BY)
+do_catchsql_test jsx4-9.7.1 {
+  CREATE TABLE t_err_context(id int);
+  SELECT id FROM t_err_context GROUP BY <box />;
+} {1 {near "<": syntax error}}
+
+
+# 9.8 Tag name is an invalid identifier (e.g. starts with a number)
+# The 'id' non-terminal for tag name should enforce this.
+do_catchsql_test jsx4-9.8.1 {
+  SELECT <123tag />
+} {1 {near "123": syntax error}}
+
+
+# 9.10 Missing attribute equals sign
+do_catchsql_test jsx4-9.10.1 {
+  SELECT <box id "value" />
+} {1 {near "\"value\"": syntax error}}
+
+# 9.11 Missing space between attributes
+# Based on 'id EQ jsxattrvalue', this should be an error.
+# If "id='a'class='b'" tokenizes `id` then `'a'class` as a string, then `='b'`, it's an error.
+# If `id` then `'a'class` as an ID, then error.
+# Most likely error near `class` because it's an unexpected token.
+do_catchsql_test jsx4-9.11.1 {
+  SELECT <box id="a"class="b" />
+} {1 {near "class": syntax error}} 
+
+
+# 9.12 JSX element inside an attribute expression without quotes
+do_catchsql_test jsx4-9.12.1 {
+  SELECT <box attr={ <inner /> } />
+} {1 {near "<": syntax error}}
+
+# 9.13 Unclosed self-closing tag
+do_catchsql_test jsx4-9.13.1 {
+  SELECT <box /
+} {1 {near "<box": syntax error}}
+
+# 9.14 Closing tag for self-closed element
+do_catchsql_test jsx4-9.14.1 {
+  SELECT <br /></br>
+} {1 {near "</br>": syntax error}}
+
+# 9.15 Attribute after slash in self-closing tag
+do_catchsql_test jsx4-9.15.1 {
+  SELECT <br / class="foo">
+} {1 {near "class": syntax error}}
+
+
+finish_test

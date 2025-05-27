@@ -1,0 +1,100 @@
+# Test file for JSX-like syntax parsing - Part 3: WITH clause, Complex Expressions, and other interactions
+
+# Load the Tcl test harness
+if {![info exists testdir]} {
+    set testdir [file dirname $argv0]
+}
+source $testdir/tester.tcl
+load_static_extension $db define
+
+# Define a helper UDF that reflects its arguments as a JSON array string.
+do_execsql_test jsx3-setup {
+  SELECT define('reflect_jsx_args', 'SELECT json_array(json_valid(json_arg(0)), json_arg(0), json_valid(json_arg(1)), json_arg(1))');
+} {}
+
+# Test cases
+# 6. Interaction with WITH clause
+do_execsql_test jsx3-6.1 {
+  WITH data(val, name) AS (VALUES (1, 'First'), (2, 'Second'))
+  SELECT <reflect_jsx_args data-val={val} title={name} /> FROM data ORDER BY val;
+} {\[[1,"{\"data-val\":1,\"title\":\"First\"}",1,"[]"], [1,"{\"data-val\":2,\"title\":\"Second\"}",1,"[]"]]}
+
+do_execsql_test jsx3-6.2 {
+  WITH RECURSIVE
+    cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<3)
+  SELECT <reflect_jsx_args value={x} /> FROM cnt ORDER BY x;
+} {\[[1,"{\"value\":1}",1,"[]"], [1,"{\"value\":2}",1,"[]"], [1,"{\"value\":3}",1,"[]"]]}
+
+# 7. Complex Expressions
+# 7.1 Subquery in attribute
+do_execsql_test jsx3-7.1 {
+  CREATE TABLE items(name TEXT, price REAL);
+  INSERT INTO items VALUES ('item1', 10.0), ('item2', 20.0), ('item3', 30.0);
+  SELECT <reflect_jsx_args 
+            total_price={ (SELECT sum(price) FROM items) } 
+            item_count={ (SELECT count(*) FROM items) } 
+          />;
+} {[1,"{\"item_count\":3,\"total_price\":60.0}",1,"[]"]}
+
+
+# 7.2 Subquery in child
+do_execsql_test jsx3-7.2 {
+  CREATE TABLE messages(msg TEXT);
+  INSERT INTO messages VALUES ('Hello'), ('World');
+  SELECT <reflect_jsx_args>{(SELECT group_concat(msg,', ') FROM messages)}</reflect_jsx_args>;
+} {[1,"{}",1,"[\"Hello, World\"]"]}
+
+# 7.3 CASE expression in attribute
+do_execsql_test jsx3-7.3 {
+  CREATE TABLE t_case(x INT, y TEXT);
+  INSERT INTO t_case VALUES (1, 'one'), (2, 'two'), (3, 'other');
+  SELECT <reflect_jsx_args
+            value={x}
+            name={CASE WHEN x=1 THEN y ELSE 'not one' END} 
+            status={CASE y WHEN 'two' THEN 'deux' ELSE 'autre' END}
+          /> 
+  FROM t_case ORDER BY x;
+} {\[[1,"{\"name\":\"one\",\"status\":\"autre\",\"value\":1}",1,"[]"], [1,"{\"name\":\"not one\",\"status\":\"deux\",\"value\":2}",1,"[]"], [1,"{\"name\":\"not one\",\"status\":\"autre\",\"value\":3}",1,"[]"]]}
+
+# 7.4 CASE expression in child
+do_test jsx3-7.4 {
+  execsql {SELECT <reflect_jsx_args>Value is: {CASE 1+1 WHEN 2 THEN 'Two' ELSE 'Not Two' END}</reflect_jsx_args>}
+} {[1,"{}",1,"[\"Value is: \",\"Two\"]"]}
+
+# 7.6 Attribute with empty string literal
+do_test jsx3-7.6 {
+  execsql { SELECT <reflect_jsx_args class="" /> }
+} {[1,"{\"class\":\"\"}",1,"[]"]}
+
+
+# 8. Tag Name Variations (using reflect_jsx_args as the target)
+# 8.1 Tags with hyphens 
+# The parser creates a Token for the tag name. sqlite3ExprFunction uses it.
+# If the UDF is defined as "my-tag", it should work.
+do_execsql_test jsx3-8.1-setup {
+  SELECT define('my-tag', 'SELECT json_array(json_valid(json_arg(0)), json_arg(0), json_valid(json_arg(1)), json_arg(1))');
+} {}
+do_test jsx3-8.1 {
+  execsql { SELECT <my-tag data-value="test-hyphen" /> }
+} {[1,"{\"data-value\":\"test-hyphen\"}",1,"[]"]}
+
+# 8.2 Tags with underscores
+do_execsql_test jsx3-8.2-setup {
+  SELECT define('my_component', 'SELECT json_array(json_valid(json_arg(0)), json_arg(0), json_valid(json_arg(1)), json_arg(1))');
+} {}
+do_test jsx3-8.2 {
+  execsql { SELECT <my_component data_value="test_underscore" /> }
+} {[1,"{\"data_value\":\"test_underscore\"}",1,"[]"]}
+
+# 8.3 Quoted tag name (e.g. <'my-tag-quoted' />)
+# The 'id' rule for tag name in jsxopentag accepts general identifiers,
+# which can be quoted. tokenExpr dequotes them.
+do_execsql_test jsx3-8.3-setup {
+  SELECT define('my-tag-quoted', 'SELECT json_array(json_valid(json_arg(0)), json_arg(0), json_valid(json_arg(1)), json_arg(1))');
+} {}
+do_test jsx3-8.3 {
+  execsql { SELECT <'my-tag-quoted' value=123 />}
+} {[1,"{\"value\":\"123\"}",1,"[]"]}
+
+
+finish_test

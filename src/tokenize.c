@@ -57,6 +57,8 @@
 #define CC_ILLEGAL   28    /* Illegal character */
 #define CC_NUL       29    /* 0x00 */
 #define CC_BOM       30    /* First byte of UTF8 BOM:  0xEF 0xBB 0xBF */
+#define CC_LBRACE_JSX 31   /* '{' */
+#define CC_RBRACE_JSX 32   /* '}' */
 
 static const unsigned char aiClass[] = {
 #ifdef SQLITE_ASCII
@@ -68,7 +70,7 @@ static const unsigned char aiClass[] = {
 /* 4x */    5,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
 /* 5x */    1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2,  9, 28, 28, 28,  2,
 /* 6x */    8,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
-/* 7x */    1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2, 28, 10, 28, 25, 28,
+/* 7x */    1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2, 31, 10, 32, 25, 28,
 /* 8x */   27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
 /* 9x */   27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
 /* Ax */   27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
@@ -92,8 +94,8 @@ static const unsigned char aiClass[] = {
 /* 9x */   28,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28,
 /* Ax */   28, 25,  1,  1,  1,  1,  1,  0,  2,  2, 28, 28, 28, 28, 28, 28,
 /* Bx */   28, 28, 28, 28, 28, 28, 28, 28, 28, 28,  9, 28, 28, 28, 28, 28,
-/* Cx */   28,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28,
-/* Dx */   28,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28,
+/* Cx */   31,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28, // '{' at 0xC0 for EBCDIC (CP037)
+/* Dx */   32,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28, // '}' at 0xD0 for EBCDIC (CP037)
 /* Ex */   28, 28,  1,  1,  1,  1,  1,  0,  2,  2, 28, 28, 28, 28, 28, 28,
 /* Fx */    3,  3,  3,  3,  3,  3,  3,  3,  3,  3, 28, 28, 28, 28, 28, 28,
 #endif
@@ -336,31 +338,51 @@ int sqlite3GetToken(const unsigned char *z, int *tokenType){
       return 1 + (z[1]=='=');
     }
     case CC_LT: {
-      if( (c=z[1])=='=' ){
+      if( z[1]=='/' ){
+        *tokenType = TK_JSX_CLOSE_START;
+        return 2;
+      }else if( z[1]=='=' ){
         *tokenType = TK_LE;
         return 2;
-      }else if( c=='>' ){
+      }else if( z[1]=='>' ){
         *tokenType = TK_NE;
         return 2;
-      }else if( c=='<' ){
+      }else if( z[1]=='<' ){
         *tokenType = TK_LSHIFT;
         return 2;
       }else{
-        *tokenType = TK_LT;
+        /* Default to TK_JSX_OPEN_START if no other specific SQL operator matches.
+        ** This assumes JSX context takes precedence for naked '<'.
+        ** If standard SQL TK_LT is needed for other cases where '<' is not
+        ** followed by '/', '=', '>', or '<', that logic would need to be here.
+        ** For now, per subtask, prioritizing JSX for simple '<'.
+        */
+        *tokenType = TK_JSX_OPEN_START;
         return 1;
       }
     }
     case CC_GT: {
-      if( (c=z[1])=='=' ){
+      if( z[1]=='=' ){
         *tokenType = TK_GE;
         return 2;
-      }else if( c=='>' ){
+      }else if( z[1]=='>' ){
         *tokenType = TK_RSHIFT;
         return 2;
       }else{
-        *tokenType = TK_GT;
+        /* Default to TK_JSX_OPEN_END if no other specific SQL operator matches.
+        ** Similar to '<', this prioritizes JSX for simple '>'.
+        */
+        *tokenType = TK_JSX_OPEN_END;
         return 1;
       }
+    }
+    case CC_LBRACE_JSX: {
+      *tokenType = TK_JSX_EXPR_START;
+      return 1;
+    }
+    case CC_RBRACE_JSX: {
+      *tokenType = TK_JSX_EXPR_END;
+      return 1;
     }
     case CC_BANG: {
       if( z[1]!='=' ){

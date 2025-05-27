@@ -1,0 +1,100 @@
+# Test file for JSX-like syntax parsing - Part 2: Children and Nesting
+
+# Load the Tcl test harness
+if {![info exists testdir]} {
+    set testdir [file dirname $argv0]
+}
+source $testdir/tester.tcl
+load_static_extension $db define
+
+# Define a helper UDF that reflects its arguments as a JSON array string.
+do_execsql_test jsx2-setup {
+  SELECT define('reflect_jsx_args', 'SELECT json_array(json_valid(json_arg(0)), json_arg(0), json_valid(json_arg(1)), json_arg(1))');
+} {}
+
+# Test cases
+# 3. Children
+# 3.1 Text child
+#   Input: <reflect_jsx_args>hello</reflect_jsx_args>
+#   Expected call: reflect_jsx_args(jsonb_object(), json_array('hello'))
+#   Output: '[1,"{}",1,"[\"hello\"]"]'
+do_test jsx2-3.1 {
+  execsql {SELECT <reflect_jsx_args>hello</reflect_jsx_args>}
+} {[1,"{}",1,"[\"hello\"]"]}
+
+# 3.2 Expression child
+#   Input: <reflect_jsx_args>{10 + 20}</reflect_jsx_args>
+#   Expected call: reflect_jsx_args(jsonb_object(), json_array(30))
+#   Output: '[1,"{}",1,"[30]"]'
+do_test jsx2-3.2 {
+  execsql {SELECT <reflect_jsx_args>{10 + 20}</reflect_jsx_args>}
+} {[1,"{}",1,"[30]"]}
+
+# 3.3 Multiple children (text, expression)
+#   Input: <reflect_jsx_args>Name: {'User'} Age: {20+5}</reflect_jsx_args>
+#   Expected call: reflect_jsx_args(jsonb_object(), json_array('Name: ', 'User', ' Age: ', 25))
+#   Output: '[1,"{}",1,"[\"Name: \",\"User\",\" Age: \",25]"]'
+do_test jsx2-3.3 {
+  execsql {SELECT <reflect_jsx_args>Name: {'User'} Age: {20+5}</reflect_jsx_args>}
+} {[1,"{}",1,"[\"Name: \",\"User\",\" Age: \",25]"]}
+
+# 3.4 Child from table column
+do_execsql_test jsx2-3.4 {
+  CREATE TABLE users(name TEXT, age INTEGER);
+  INSERT INTO users VALUES('Alice', 30);
+  SELECT <reflect_jsx_args>Hello {users.name}, you are {users.age}.</reflect_jsx_args> FROM users;
+} {[1,"{}",1,"[\"Hello \",\"Alice\",\", you are \",30,\".\"]"]}
+
+
+# 4. Nested Elements
+# 4.1 Simple nesting
+#   Input: <reflect_jsx_args><reflect_jsx_args_inner /></reflect_jsx_args>
+#   Expected call: reflect_jsx_args(jsonb_object(), json_array( reflect_jsx_args_inner(jsonb_object(), json_array()) ))
+#   We'll use reflect_jsx_args for the inner tag as well.
+#   Inner call: reflect_jsx_args_inner -> reflect_jsx_args({}, []) -> '[1,"{}",1,"[]"]' (as a string)
+#   Outer call: reflect_jsx_args({}, [inner_string_result])
+#   Output: '[1,"{}",1,"[\"[1,\\\"{}\\\",1,\\\"[]\\\"]\"]"]' (JSON string containing JSON representation)
+do_execsql_test jsx2-4.1-setup-inner {
+  SELECT define('reflect_jsx_args_inner', 'SELECT json_array(json_valid(json_arg(0)), json_arg(0), json_valid(json_arg(1)), json_arg(1))');
+} {}
+do_test jsx2-4.1 {
+  execsql {SELECT <reflect_jsx_args><reflect_jsx_args_inner /></reflect_jsx_args>}
+} {[1,"{}",1,"[\"[1,\\\"{}\\\",1,\\\"[]\\\"]\"]"]}
+
+# 4.2 Nesting with attributes and children
+#   Input: <reflect_jsx_args id="outer"><reflect_jsx_args_inner class="inner">Text</reflect_jsx_args_inner></reflect_jsx_args>
+#   Inner call: reflect_jsx_args_inner(jsonb_object('class','inner'), json_array('Text'))
+#     -> '[1,"{\"class\":\"inner\"}",1,"[\"Text\"]"]'
+#   Outer call: reflect_jsx_args(jsonb_object('id','outer'), json_array( inner_result_string ))
+#   Output: '[1,"{\"id\":\"outer\"}",1,"[\"[1,\\\"{\\\\\\\"class\\\\\\\":\\\\\\\"inner\\\\\\\"}\\\",1,\\\"[\\\\\\\"Text\\\\\\\"]\\\"]\"]"]'
+do_test jsx2-4.2 {
+  execsql {SELECT <reflect_jsx_args id="outer"><reflect_jsx_args_inner class="inner">Text</reflect_jsx_args_inner></reflect_jsx_args>}
+} {[1,"{\"id\":\"outer\"}",1,"[\"[1,\\\"{\\\\\\\"class\\\\\\\":\\\\\\\"inner\\\\\\\"}\\\",1,\\\"[\\\\\\\"Text\\\\\\\"]\\\"]\"]"]}
+
+
+# 4.3 Mixed children with nested elements
+#   Input: <reflect_jsx_args>Hello <reflect_jsx_args_inner name={'World'} /> from SQLite!</reflect_jsx_args>
+#   Inner call: reflect_jsx_args_inner(jsonb_object('name','World'), json_array())
+#     -> '[1,"{\"name\":\"World\"}",1,"[]"]'
+#   Outer call: reflect_jsx_args(jsonb_object(), json_array('Hello ', inner_result_string, ' from SQLite!'))
+#   Output: '[1,"{}",1,"[\"Hello \",\"[1,\\\"{\\\\\\\"name\\\\\\\":\\\\\\\"World\\\\\\\"}\\\",1,\\\"[]\\\"]\",\" from SQLite!\"]"]'
+do_test jsx2-4.3 {
+  execsql {SELECT <reflect_jsx_args>Hello <reflect_jsx_args_inner name={'World'} /> from SQLite!</reflect_jsx_args>}
+} {[1,"{}",1,"[\"Hello \",\"[1,\\\"{\\\\\\\"name\\\\\\\":\\\\\\\"World\\\\\\\"}\\\",1,\\\"[]\\\"]\",\" from SQLite!\"]"]}
+
+# 4.4 Deeper nesting
+#   <reflect_jsx_args a=1> <reflect_jsx_args_inner b=2> <reflect_jsx_args_deep c=3> Text </reflect_jsx_args_deep> </reflect_jsx_args_inner> </reflect_jsx_args>
+#   Deep: reflect_jsx_args_deep({"c":3}, ["Text"]) -> '[1,"{\"c\":3}",1,"[\"Text\"]"]' (string S3)
+#   Inner: reflect_jsx_args_inner({"b":2}, [S3])   -> '[1,"{\"b\":2}",1,["S3"]]' (string S2)
+#   Outer: reflect_jsx_args({"a":1}, [S2])         -> '[1,"{\"a\":1}",1,["S2"]]' (string S1)
+do_execsql_test jsx2-4.4-setup-deep {
+  SELECT define('reflect_jsx_args_deep', 'SELECT json_array(json_valid(json_arg(0)), json_arg(0), json_valid(json_arg(1)), json_arg(1))');
+} {}
+do_test jsx2-4.4 {
+  execsql {
+    SELECT <reflect_jsx_args a=1><reflect_jsx_args_inner b=2><reflect_jsx_args_deep c=3>Text</reflect_jsx_args_deep></reflect_jsx_args_inner></reflect_jsx_args>
+  }
+} {[1,"{\"a\":1}",1,"[\"[1,\\\"{\\\\\\\"b\\\\\\\":2}\\\",1,\\\"[\\\\\\\"[1,\\\\\\\\\\\\\\\"{\\\\\\\\\\\\\\\"c\\\\\\\\\\\\\\\":3}\\\\\\\\\\\\\\\",1,\\\\\\\\\\\\\\\"[\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\"Text\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\"]\\\\\\\\\\\\\\\"]\\\\\\\"]\\\"]\"]"]}
+
+
+finish_test

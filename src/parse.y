@@ -158,6 +158,64 @@ static void updateDeleteLimitError(
 }
 #endif /* SQLITE_ENABLE_UPDATE_DELETE_LIMIT */
 
+// Helper function to create a TK_FUNCTION Expr for jsonb_object.
+// Input: ExprList of attributes (each TK_EQ(TK_ID name, value)).
+// Ownership of pAttributes and its sub-expressions is taken.
+static Expr* sqlite3CreateJsonbObjectExpr(Parse *pParse, ExprList *pAttributes){
+  sqlite3 *db = pParse->db;
+  ExprList *pArgs = 0; 
+  Expr *pJsonFunc = 0;
+
+  if( pAttributes ){
+    int i;
+    for(i=0; i<pAttributes->nExpr; i++){
+      Expr *pAttrEq = pAttributes->a[i].pExpr;
+      assert(pAttrEq && pAttrEq->op==TK_EQ);
+      Expr *pNameIdExpr = pAttrEq->pLeft; 
+      Expr *pValueExpr = pAttrEq->pRight;
+      Token nameToken;
+
+      assert(pNameIdExpr && (pNameIdExpr->op==TK_ID || pNameIdExpr->op==TK_STRING) && pNameIdExpr->u.zToken);
+      
+      sqlite3TokenInit(&nameToken, (char*)pNameIdExpr->u.zToken); 
+      Expr *pNameStrExpr = tokenExpr(pParse, TK_STRING, nameToken);
+      if( !pNameStrExpr ) goto object_oom_jsonb_final;
+      
+      pArgs = sqlite3ExprListAppend(pParse, pArgs, pNameStrExpr);
+      if( !pArgs ) { sqlite3ExprDelete(db, pNameStrExpr); goto object_oom_jsonb_final; }
+
+      Expr *pDupValueExpr = sqlite3ExprDup(db, pValueExpr, 0);
+      if( !pDupValueExpr ) goto object_oom_jsonb_final;
+
+      pArgs = sqlite3ExprListAppend(pParse, pArgs, pDupValueExpr);
+      if( !pArgs ) { sqlite3ExprDelete(db, pDupValueExpr); goto object_oom_jsonb_final; }
+    }
+  }
+  
+  Token funcNameToken; 
+  sqlite3TokenInit(&funcNameToken, (char*)"jsonb_object"); 
+  pJsonFunc = sqlite3ExprFunction(pParse, pArgs, &funcNameToken, 0);
+
+object_oom_jsonb_final:
+  if( pAttributes ) sqlite3ExprListDelete(db, pAttributes); 
+  if( db->mallocFailed && pJsonFunc==0 && pArgs!=0 ) sqlite3ExprListDelete(db, pArgs);
+  return pJsonFunc;
+}
+
+// Helper function to create a TK_FUNCTION Expr for json_array.
+// Input: ExprList of children. Ownership of pChildren is taken if successful.
+static Expr* sqlite3CreateJsonArrayExpr(Parse *pParse, ExprList *pChildren){
+  Token funcNameToken; 
+  sqlite3TokenInit(&funcNameToken, (char*)"json_array");
+  Expr *pJsonFunc = sqlite3ExprFunction(pParse, pChildren, &funcNameToken, 0);
+  if(pParse->db->mallocFailed && pJsonFunc==0 && pChildren!=0){
+    // If sqlite3ExprFunction failed and nulled pJsonFunc, but pChildren was not NULL,
+    // sqlite3ExprFunction should have deleted pChildren.
+    // If pChildren was NULL, it's fine.
+  }
+  return pJsonFunc;
+}
+
 } // end %include
 
 // Input is a single SQL command
@@ -262,6 +320,8 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
 %token CONFLICT DATABASE DEFERRED DESC DETACH EACH END EXCLUSIVE EXPLAIN FAIL.
 %token OR AND NOT IS ISNOT MATCH LIKE_KW BETWEEN IN ISNULL NOTNULL NE EQ.
 %token GT LE LT GE ESCAPE.
+%token TK_JSX_OPEN_START TK_JSX_OPEN_END TK_JSX_CLOSE_START TK_JSX_EXPR_START TK_JSX_EXPR_END TK_SLASH.
+
 
 // The following directive causes tokens ABORT, AFTER, ASC, etc. to
 // fallback to ID if they will not parse as their original value.
@@ -690,12 +750,44 @@ distinct(A) ::= .           {A = 0;}
 %destructor selcollist {sqlite3ExprListDelete(pParse->db, $$);}
 %type sclp {ExprList*}
 %destructor sclp {sqlite3ExprListDelete(pParse->db, $$);}
+
+// JSX related type declarations
+%type jsxelement {Expr*}
+%destructor jsxelement { sqlite3ExprDelete(pParse->db, $$); }
+%type jsxopentag {Expr*} /* Temporary carrier: op=TK_ID, u.zToken=tag_name, x.pList=attributes */
+%destructor jsxopentag { sqlite3ExprDelete(pParse->db, $$); }
+%type jsxclosetag {Token}
+// No destructor for jsxclosetag as Token is handled by Lemon
+
+%type jsxattributelist_opt {ExprList*}
+%destructor jsxattributelist_opt { sqlite3ExprListDelete(pParse->db, $$); }
+%type jsxattributelist {ExprList*}
+%destructor jsxattributelist { sqlite3ExprListDelete(pParse->db, $$); }
+%type jsxattribute {Expr*}
+%destructor jsxattribute { sqlite3ExprDelete(pParse->db, $$); }
+%type jsxattrvalue {Expr*}
+%destructor jsxattrvalue { sqlite3ExprDelete(pParse->db, $$); }
+
+%type jsxchildren_opt {ExprList*}
+%destructor jsxchildren_opt { sqlite3ExprListDelete(pParse->db, $$); }
+%type jsxchildren {ExprList*}
+%destructor jsxchildren { sqlite3ExprListDelete(pParse->db, $$); }
+%type jsxchild {Expr*}
+%destructor jsxchild { sqlite3ExprDelete(pParse->db, $$); }
+
+
 sclp(A) ::= selcollist(A) COMMA.
 sclp(A) ::= .                                {A = 0;}
 selcollist(A) ::= sclp(A) scanpt(B) expr(X) scanpt(Z) as(Y).     {
    A = sqlite3ExprListAppend(pParse, A, X);
    if( Y.n>0 ) sqlite3ExprListSetName(pParse, A, &Y, 1);
    sqlite3ExprListSetSpan(pParse,A,B,Z);
+}
+// Rule to integrate jsxelement into selcollist
+selcollist(A) ::= sclp(A) scanpt(B) jsxelement(X) scanpt(Z) as(Y). {
+    A = sqlite3ExprListAppend(pParse, A, X);
+    if( Y.n>0 ) sqlite3ExprListSetName(pParse, A, &Y, 1);
+    sqlite3ExprListSetSpan(pParse,A,B,Z);
 }
 selcollist(A) ::= sclp(A) scanpt STAR(X). {
   Expr *p = sqlite3Expr(pParse->db, TK_ASTERISK, 0);
@@ -2057,6 +2149,169 @@ filter_clause(A) ::= FILTER LP WHERE expr(X) RP.  { A = X; }
   SPAN            /* The span operator */
   ERROR           /* An expression containing an error */
 .
+
+// Rules for JSX parsing
+jsxattrvalue(A) ::= STRING(S). { A = tokenExpr(pParse, TK_STRING, S); }
+jsxattrvalue(A) ::= TK_JSX_EXPR_START expr(E) TK_JSX_EXPR_END. { A = E; }
+
+jsxattribute(A) ::= id(NAME) EQ jsxattrvalue(VALUE). {
+  Expr *pNameExpr = tokenExpr(pParse, TK_ID, NAME);
+  A = sqlite3PExpr(pParse, TK_EQ, pNameExpr, VALUE);
+}
+
+jsxattributelist(A) ::= jsxattributelist(L) jsxattribute(ATTR). { A = sqlite3ExprListAppend(pParse, L, ATTR); }
+jsxattributelist(A) ::= jsxattribute(ATTR). { A = sqlite3ExprListAppend(pParse, 0, ATTR); }
+
+jsxattributelist_opt(A) ::= . { A = 0; }
+jsxattributelist_opt(A) ::= jsxattributelist(L). { A = L; }
+
+jsxopentag(A) ::= TK_JSX_OPEN_START id(TAGNAME) jsxattributelist_opt(ATTRS) TK_JSX_OPEN_END. {
+  A = tokenExpr(pParse, TK_ID, TAGNAME); // op=TK_ID, u.zToken=tag_name (dequoted if was string)
+  if(A) A->x.pList = ATTRS; else sqlite3ExprListDelete(pParse->db, ATTRS);
+}
+
+jsxclosetag(A) ::= TK_JSX_CLOSE_START id(TAGNAME) TK_JSX_OPEN_END. { A = TAGNAME; }
+
+jsxchild(A) ::= STRING(S). { A = tokenExpr(pParse, TK_STRING, S); } 
+jsxchild(A) ::= TK_JSX_EXPR_START expr(E) TK_JSX_EXPR_END. { A = E; } 
+jsxchild(A) ::= jsxelement(E). { A = E; } 
+
+jsxchildren(A) ::= jsxchildren(L) jsxchild(CHILD). { A = sqlite3ExprListAppend(pParse, L, CHILD); }
+jsxchildren(A) ::= jsxchild(CHILD). { A = sqlite3ExprListAppend(pParse, 0, CHILD); }
+
+jsxchildren_opt(A) ::= . { A = 0; }
+jsxchildren_opt(A) ::= jsxchildren(L). { A = L; }
+
+jsxelement(A) ::= jsxopentag(OPEN_EXPR) jsxchildren_opt(CHILDREN) jsxclosetag(CLOSE_TOKEN). {
+  Expr *pAttrObjectExpr = 0;
+  Expr *pChildArrayExpr = 0;
+  ExprList *pFuncArgs = 0;
+  Token tagNameToken;
+  char *zCloseName = (char*)CLOSE_TOKEN.z;
+  int nCloseName = CLOSE_TOKEN.n;
+  char zCloseNameBuf[256]; // For dequoted closing tag name
+  sqlite3 *db = pParse->db;
+
+  A = 0; // Default to NULL result on error
+
+  assert(OPEN_EXPR && OPEN_EXPR->u.zToken);
+
+  // Dequote closing tag name if it's a string literal (e.g. </'tag-name'>)
+  // OPEN_EXPR->u.zToken is already dequoted by tokenExpr if it was a string.
+  if (nCloseName > 1 && (zCloseName[0] == '\'' || zCloseName[0] == '"' || zCloseName[0] == '`') && zCloseName[0] == zCloseName[nCloseName-1]) {
+    if (nCloseName-2 < sizeof(zCloseNameBuf)-1) { // Ensure space for null terminator
+      memcpy(zCloseNameBuf, zCloseName+1, nCloseName-2);
+      zCloseNameBuf[nCloseName-2] = 0;
+      // Handle doubled delimiters inside quoted string (e.g. 'o''neil')
+      int i=0, j=0; char delim = zCloseName[0];
+      while(zCloseNameBuf[i]){ if(zCloseNameBuf[i]==delim && zCloseNameBuf[i+1]==delim) i++; zCloseNameBuf[j++] = zCloseNameBuf[i++]; }
+      zCloseNameBuf[j] = 0;
+      zCloseName = zCloseNameBuf; nCloseName = j;
+    } else {
+      sqlite3ErrorMsg(pParse, "JSX closing tag name too long: %T", &CLOSE_TOKEN);
+      goto jsxelement_error_cleanup;
+    }
+  }
+
+  if( sqlite3Strlen30(OPEN_EXPR->u.zToken) != nCloseName || 
+      sqlite3StrNICmp(OPEN_EXPR->u.zToken, zCloseName, nCloseName) != 0 ){
+    sqlite3ErrorMsg(pParse, "JSX opening tag <%s> does not match closing tag </%T>", 
+                    OPEN_EXPR->u.zToken, &CLOSE_TOKEN);
+    goto jsxelement_error_cleanup;
+  }
+
+  pAttrObjectExpr = sqlite3CreateJsonbObjectExpr(pParse, OPEN_EXPR->x.pList);
+  OPEN_EXPR->x.pList = 0; // Ownership transferred or deleted by helper
+  if(!pAttrObjectExpr && db->mallocFailed) goto jsxelement_error_cleanup;
+
+
+  pChildArrayExpr = sqlite3CreateJsonArrayExpr(pParse, CHILDREN);
+  CHILDREN = 0; // Ownership transferred or deleted by helper
+  if(!pChildArrayExpr && db->mallocFailed) {
+    sqlite3ExprDelete(db, pAttrObjectExpr); // pAttrObjectExpr must be cleaned up
+    goto jsxelement_error_cleanup;
+  }
+  
+  pFuncArgs = sqlite3ExprListAppend(pParse, 0, pAttrObjectExpr);
+  if(!pFuncArgs) { // OOM or pAttrObjectExpr was NULL and append did nothing
+     sqlite3ExprDelete(db, pAttrObjectExpr); // If pAttrObjectExpr was non-NULL but append failed
+     sqlite3ExprDelete(db, pChildArrayExpr); 
+     goto jsxelement_error_cleanup;
+  }
+  
+  pFuncArgs = sqlite3ExprListAppend(pParse, pFuncArgs, pChildArrayExpr);
+  if(!pFuncArgs) { // OOM: sqlite3ExprListAppend frees its first arg on failure
+     sqlite3ExprDelete(db, pChildArrayExpr); // If pChildArrayExpr was non-NULL but append failed
+     goto jsxelement_error_cleanup;
+  }
+
+  sqlite3TokenInit(&tagNameToken, OPEN_EXPR->u.zToken);
+  A = sqlite3ExprFunction(pParse, pFuncArgs, &tagNameToken, 0);
+  // If A is NULL due to OOM, sqlite3ExprFunction frees pFuncArgs (which includes its elements)
+
+jsxelement_error_cleanup:
+  sqlite3ExprDelete(db, OPEN_EXPR); // Delete the temporary carrier OPEN_EXPR
+  if (A==0){ // If main function creation failed or any prior error
+    sqlite3ExprListDelete(db, CHILDREN); // Delete CHILDREN if not transferred (e.g. error before pChildArrayExpr created)
+  }
+}
+
+jsxelement(A) ::= TK_JSX_OPEN_START id(TAGNAME) jsxattributelist_opt(ATTRS) TK_SLASH TK_JSX_OPEN_END. {
+  Expr *pAttrObjectExpr = 0;
+  Expr *pChildArrayExpr = 0;
+  ExprList *pFuncArgs = 0;
+  Token tagNameToken;
+  sqlite3 *db = pParse->db;
+  
+  A = 0; // Default to NULL
+
+  pAttrObjectExpr = sqlite3CreateJsonbObjectExpr(pParse, ATTRS);
+  ATTRS = 0; // Ownership transferred or deleted by helper
+  if(!pAttrObjectExpr && db->mallocFailed) goto jsxselfclosing_cleanup;
+
+  pChildArrayExpr = sqlite3CreateJsonArrayExpr(pParse, 0); // No children, so pass NULL ExprList
+  if(!pChildArrayExpr && db->mallocFailed) {
+     sqlite3ExprDelete(db, pAttrObjectExpr);
+     goto jsxselfclosing_cleanup;
+  }
+
+  pFuncArgs = sqlite3ExprListAppend(pParse, 0, pAttrObjectExpr);
+   if(!pFuncArgs) { 
+     sqlite3ExprDelete(db, pAttrObjectExpr); 
+     sqlite3ExprDelete(db, pChildArrayExpr); 
+     goto jsxselfclosing_cleanup;
+   }
+  
+  pFuncArgs = sqlite3ExprListAppend(pParse, pFuncArgs, pChildArrayExpr);
+   if(!pFuncArgs) { // Append failed, pAttrObjectExpr was in list and freed by append
+     sqlite3ExprDelete(db, pChildArrayExpr); 
+     goto jsxselfclosing_cleanup;
+   }
+
+  sqlite3TokenInit(&tagNameToken, (char*)TAGNAME.z); 
+  A = sqlite3ExprFunction(pParse, pFuncArgs, &tagNameToken, 0);
+  // If A is NULL due to OOM, sqlite3ExprFunction frees pFuncArgs
+
+jsxselfclosing_cleanup:
+  // If A is NULL (error), and any intermediate Expr* (pAttrObjectExpr, pChildArrayExpr) 
+  // were not successfully passed to a list that got cleaned by sqlite3ExprFunction,
+  // they need explicit cleanup. However, the logic above tries to ensure they are 
+  // either passed or cleaned. If pFuncArgs creation fails at any step, the already
+  // created Expr* for jsonb_object or json_array should be cleaned.
+  // sqlite3ExprListAppend handles cleaning the Expr if the list itself cannot be allocated/grown.
+  // sqlite3ExprFunction handles cleaning the list if the function Expr cannot be allocated.
+  // The main risk is if ATTRS or CHILDREN were not successfully passed to the helpers.
+  // But the helpers now take ownership and delete the original list.
+  if(A==0){
+      // This path is taken if any step above fails and jumps to cleanup.
+      // If pFuncArgs was allocated but sqlite3ExprFunction failed, pFuncArgs is freed by it.
+      // If pFuncArgs itself failed allocation, its components were freed by sqlite3ExprListAppend or manually.
+      // So, by this point, components should generally be handled.
+      // Ensure ATTRS is always cleared if not used by sqlite3CreateJsonbObjectExpr (which it is now)
+      sqlite3ExprListDelete(db, ATTRS); 
+  }
+}
+
 
 term(A) ::= QNUMBER(X). {
   A=tokenExpr(pParse,@X,X);

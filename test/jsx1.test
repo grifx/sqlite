@@ -1,0 +1,101 @@
+# Test file for JSX-like syntax parsing - Part 1: Basic elements and attributes
+
+# Load the Tcl test harness
+if {![info exists testdir]} {
+    set testdir [file dirname $argv0]
+}
+source $testdir/tester.tcl
+load_static_extension $db define
+
+# Define a helper UDF that reflects its arguments as a JSON array string.
+# This allows us to inspect what the parser produces for the UDF call.
+# The JSX tag <tag_name ... /> will be transformed into a call:
+# tag_name(jsonb_object(...attributes...), json_array(...children...))
+# Our reflect_jsx_args will be used as the "tag_name" UDF.
+# It will receive the two JSON strings as text arguments.
+do_execsql_test jsx1-setup {
+  SELECT define('reflect_jsx_args', 'SELECT json_array(json_valid(json_arg(0)), json_arg(0), json_valid(json_arg(1)), json_arg(1))');
+} {}
+
+# Test cases
+# 1. Basic Element (no attributes, no children)
+#   - Self-closing: <reflect_jsx_args />
+#   - With closing tag: <reflect_jsx_args></reflect_jsx_args>
+#   Expected: reflect_jsx_args(jsonb_object(), json_array())
+#   Output of reflect_jsx_args: '[1,"{}",1,"[]"]' (json_valid is 1 if valid JSON)
+do_test jsx1-1.1 {
+  execsql {SELECT <reflect_jsx_args />}
+} {[1,"{}",1,"[]"]}
+
+do_test jsx1-1.2 {
+  execsql {SELECT <reflect_jsx_args></reflect_jsx_args>}
+} {[1,"{}",1,"[]"]}
+
+# 2. Attributes
+# 2.1 Literal string attribute
+#   Input: <reflect_jsx_args id="main" />
+#   Expected call: reflect_jsx_args(jsonb_object('id', 'main'), json_array())
+#   Output: '[1,"{\"id\":\"main\"}",1,"[]"]'
+do_test jsx1-2.1 {
+  execsql {SELECT <reflect_jsx_args id='main' />}
+} {[1,"{\"id\":\"main\"}",1,"[]"]}
+
+# 2.2 Literal numeric attribute (should be treated as string by jsonb_object if not an expression)
+#   Actually, the parser rule for jsxattrvalue STRING makes it a string.
+#   If `id=123` was meant to be numeric, it should be `id={123}`.
+#   So, `id="123"` results in `jsonb_object('id', '123')`.
+do_test jsx1-2.2 {
+  execsql {SELECT <reflect_jsx_args id='123' />}
+} {[1,"{\"id\":\"123\"}",1,"[]"]}
+
+# 2.3 Expression attribute
+#   Input: <reflect_jsx_args count={1+2} />
+#   Expected call: reflect_jsx_args(jsonb_object('count', 3), json_array())
+#   Output: '[1,"{\"count\":3}",1,"[]"]'
+do_test jsx1-2.3 {
+  execsql {SELECT <reflect_jsx_args count={1+2} />}
+} {[1,"{\"count\":3}",1,"[]"]}
+
+# 2.4 Multiple attributes (literals and expressions)
+#   Input: <reflect_jsx_args name='item' value={ (SELECT 10*2) } enabled='true' />
+#   Expected: reflect_jsx_args(jsonb_object('name','item','value',20,'enabled','true'), json_array())
+#   Output: '[1,"{\"name\":\"item\",\"value\":20,\"enabled\":\"true\"}",1,"[]"]'
+do_test jsx1-2.4 {
+  execsql {SELECT <reflect_jsx_args name='item' value={ (SELECT 10*2) } enabled='true' />}
+} {[1,"{\"name\":\"item\",\"value\":20,\"enabled\":\"true\"}",1,"[]"]}
+
+# 2.5 Attribute with column value from a table
+do_execsql_test jsx1-2.5 {
+  CREATE TABLE t1(id_val INT, name_val TEXT);
+  INSERT INTO t1 VALUES(99, 'TestName');
+  SELECT <reflect_jsx_args data-id={t1.id_val} data-name={t1.name_val} static='val' /> FROM t1;
+} {[1,"{\"data-id\":99,\"data-name\":\"TestName\",\"static\":\"val\"}",1,"[]"]}
+
+
+# 3. Self-Closing Tags (already implicitly tested, but more explicit)
+#    These are identical to tests 1.1, 2.1, 2.3, 2.4 in terms of expected UDF arguments
+do_test jsx1-3.1-selfclosing-noargs {
+  execsql {SELECT <reflect_jsx_args /> }
+} {[1,"{}",1,"[]"]}
+
+do_test jsx1-3.2-selfclosing-literal-attr {
+  execsql {SELECT <reflect_jsx_args data-id='xyz' />}
+} {[1,"{\"data-id\":\"xyz\"}",1,"[]"]}
+
+do_test jsx1-3.3-selfclosing-expr-attr {
+  execsql {SELECT <reflect_jsx_args price={15.99} />}
+} {[1,"{\"price\":15.99}",1,"[]"]}
+
+# 4. Quoted attribute names (not standard JSX but good to test if parser allows via 'id' token)
+#    The grammar uses 'id' for attribute name, which can be a quoted identifier.
+#    jsonb_object keys are strings. 'tokenExpr' dequotes quoted IDs.
+do_test jsx1-4.1-quoted-attr-name {
+  execsql {SELECT <reflect_jsx_args "data-value"='quoted_key' />}
+} {[1,"{\"data-value\":\"quoted_key\"}",1,"[]"]}
+
+do_test jsx1-4.2-quoted-attr-name-expr {
+  execsql {SELECT <reflect_jsx_args "complex-key"={3*3} />}
+} {[1,"{\"complex-key\":9}",1,"[]"]}
+
+
+finish_test
