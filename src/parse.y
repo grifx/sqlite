@@ -309,6 +309,7 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
 %right NOT.
 %left IS MATCH LIKE_KW BETWEEN IN ISNULL NOTNULL NE EQ.
 %left GT LE LT GE.
+%nonassoc JSX_TEXT.
 %right ESCAPE.
 %left BITAND BITOR LSHIFT RSHIFT.
 %left PLUS MINUS.
@@ -317,6 +318,8 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
 %left COLLATE.
 %right BITNOT.
 %nonassoc ON.
+%left LBRACE.
+%right RBRACE.
 
 // An IDENTIFIER can be a generic identifier, or one of several
 // keywords.  Any non-standard keyword can also be an identifier.
@@ -1099,6 +1102,16 @@ idlist(A) ::= nm(Y).
 %destructor expr {sqlite3ExprDelete(pParse->db, $$);}
 %type term {Expr*}
 %destructor term {sqlite3ExprDelete(pParse->db, $$);}
+%type jsx_content {Expr*}
+%destructor jsx_content {sqlite3ExprDelete(pParse->db, $$);}
+%type jsx_item {Expr*}
+%destructor jsx_item {sqlite3ExprDelete(pParse->db, $$);}
+%type jsx_attributes {Expr*}
+%destructor jsx_attributes {sqlite3ExprDelete(pParse->db, $$);}
+%type jsx_attribute {struct {Token name; Expr* value;}}
+%destructor jsx_attribute {sqlite3ExprDelete(pParse->db, $$.value);}
+%type jsx_expr {Expr*}
+%destructor jsx_expr {sqlite3ExprDelete(pParse->db, $$);}
 
 %include {
 
@@ -1136,6 +1149,70 @@ idlist(A) ::= nm(Y).
     return p;
   }
 
+  static Expr *makeJSXElement(Parse *pParse, Token *pTag, Expr *pProps, Expr *pChildren){
+    if( pTag->n > 0 && pTag->z[0] >= 'A' && pTag->z[0] <= 'Z' && 
+        !(pTag->n == 8 && memcmp(pTag->z, "Fragment", 8) == 0) ){
+      Token jsonPatchFunc = { "json_patch", 10 };
+      Token jsonObjFunc = { "json_object", 11 };
+      Token childrenKey = { "children", 8 };
+      
+      Expr *pChildrenKey = sqlite3ExprAlloc(pParse->db, TK_STRING, &childrenKey, 1);
+      ExprList *pChildrenObjList = sqlite3ExprListAppend(pParse, 0, pChildrenKey);
+      pChildrenObjList = sqlite3ExprListAppend(pParse, pChildrenObjList, pChildren);
+      Expr *pChildrenObj = sqlite3ExprFunction(pParse, pChildrenObjList, &jsonObjFunc, 0);
+      
+      ExprList *pMergeList = sqlite3ExprListAppend(pParse, 0, pProps);
+      pMergeList = sqlite3ExprListAppend(pParse, pMergeList, pChildrenObj);
+      Expr *pMergedProps = sqlite3ExprFunction(pParse, pMergeList, &jsonPatchFunc, 0);
+      
+      ExprList *pList = sqlite3ExprListAppend(pParse, 0, pMergedProps);
+      return sqlite3ExprFunction(pParse, pList, pTag, 0);
+    } else {
+      Token jsonObjFunc = { "json_object", 11 };
+      Token typeKey     = { "type", 4 };
+      Token propsKey    = { "props", 5 };
+      Token childrenKey = { "children", 8 };
+
+      Expr *pTypeKey     = sqlite3ExprAlloc(pParse->db, TK_STRING, &typeKey, 1);
+      Expr *pTagName     = sqlite3ExprAlloc(pParse->db, TK_STRING, pTag, 1);
+      Expr *pPropsKey    = sqlite3ExprAlloc(pParse->db, TK_STRING, &propsKey, 1);
+      Expr *pChildrenKey = sqlite3ExprAlloc(pParse->db, TK_STRING, &childrenKey, 1);
+
+      ExprList *pList = sqlite3ExprListAppend(pParse, 0, pTypeKey);
+      pList = sqlite3ExprListAppend(pParse, pList, pTagName);
+      pList = sqlite3ExprListAppend(pParse, pList, pPropsKey);
+      pList = sqlite3ExprListAppend(pParse, pList, pProps);
+      pList = sqlite3ExprListAppend(pParse, pList, pChildrenKey);
+      pList = sqlite3ExprListAppend(pParse, pList, pChildren);
+
+      return sqlite3ExprFunction(pParse, pList, &jsonObjFunc, 0);
+    }
+  }
+
+  static Expr *appendJSXContent(Parse *pParse, Expr *X, Expr *Y){
+    Token jsonArray, jsonInsert, arrayPath;
+
+    if( X && X->op == TK_FUNCTION && X->u.zToken &&
+        (strcmp(X->u.zToken, "json_array") == 0 || strcmp(X->u.zToken, "json_insert") == 0) ){
+      jsonInsert.z = "json_insert";
+      jsonInsert.n = 11;
+      arrayPath.z = "$[#]";
+      arrayPath.n = 4;
+
+      Expr *pPath = sqlite3ExprAlloc(pParse->db, TK_STRING, &arrayPath, 1);
+      ExprList *pList = sqlite3ExprListAppend(pParse, 0, X);
+      pList = sqlite3ExprListAppend(pParse, pList, pPath);
+      pList = sqlite3ExprListAppend(pParse, pList, Y);
+      return sqlite3ExprFunction(pParse, pList, &jsonInsert, 0);
+    } else {
+      jsonArray.z = "json_array";
+      jsonArray.n = 10;
+
+      ExprList *pList = sqlite3ExprListAppend(pParse, 0, X);
+      pList = sqlite3ExprListAppend(pParse, pList, Y);
+      return sqlite3ExprFunction(pParse, pList, &jsonArray, 0);
+    }
+  }
 }
 
 expr(A) ::= term(A).
@@ -2056,6 +2133,9 @@ filter_clause(A) ::= FILTER LP WHERE expr(X) RP.  { A = X; }
   ASTERISK        /* The "*" in count(*) and similar */
   SPAN            /* The span operator */
   ERROR           /* An expression containing an error */
+  JSX_TEXT        /* JSX text content */
+  LBRACE          /* Left brace { */
+  RBRACE          /* Right brace } */
 .
 
 term(A) ::= QNUMBER(X). {
@@ -2081,3 +2161,133 @@ term(A) ::= QNUMBER(X). {
 ** so that they are guaranteed to be the last three.
 */
 %token SPACE COMMENT ILLEGAL.
+
+jsx_content(A) ::= jsx_item(X). {
+  A = X;
+}
+
+jsx_content(A) ::= jsx_content(X) jsx_item(Y). {
+  A = appendJSXContent(pParse, X, Y);
+}
+
+jsx_content(A) ::= JSX_TEXT(X). {  A = sqlite3ExprAlloc(pParse->db, TK_STRING, &X, 1);
+}
+
+jsx_content(A) ::= id(X). {
+  A = sqlite3ExprAlloc(pParse->db, TK_STRING, &X, 1);
+}
+
+jsx_content(A) ::= INTEGER(X). {
+  A = sqlite3ExprAlloc(pParse->db, TK_STRING, &X, 1);
+}
+
+jsx_content(A) ::= FLOAT(X). {
+  A = sqlite3ExprAlloc(pParse->db, TK_STRING, &X, 1);
+}
+
+jsx_content(A) ::= LBRACE jsx_expr(X) RBRACE. {
+  A = X;
+}
+
+jsx_content(A) ::= jsx_content(X) JSX_TEXT(Y). {
+  Expr *pNewText = sqlite3ExprAlloc(pParse->db, TK_STRING, &Y, 1);
+
+  A = appendJSXContent(pParse, X, pNewText);
+}
+
+jsx_content(A) ::= jsx_content(X) id(Y). {
+  Expr *pNewText = sqlite3ExprAlloc(pParse->db, TK_STRING, &Y, 1);
+
+  A = appendJSXContent(pParse, X, pNewText);
+}
+
+jsx_content(A) ::= jsx_content(X) INTEGER(Y). {
+  Expr *pNewText = sqlite3ExprAlloc(pParse->db, TK_STRING, &Y, 1);
+
+  A = appendJSXContent(pParse, X, pNewText);
+}
+
+jsx_content(A) ::= jsx_content(X) FLOAT(Y). {
+  Expr *pNewText = sqlite3ExprAlloc(pParse->db, TK_STRING, &Y, 1);
+
+  A = appendJSXContent(pParse, X, pNewText);
+}
+
+jsx_content(A) ::= jsx_content(X) LBRACE jsx_expr(Y) RBRACE. {
+  A = appendJSXContent(pParse, X, Y);
+}
+
+jsx_attributes(A) ::= . {
+  A = sqlite3ExprAlloc(pParse->db, TK_NULL, 0, 0);
+}
+
+jsx_attributes(A) ::= jsx_attribute(X). {
+  // Create json_object with single attribute
+  Token jsonObjFunc;
+  jsonObjFunc.z = "json_object";
+  jsonObjFunc.n = 11;
+  
+  Expr *pAttrName = sqlite3ExprAlloc(pParse->db, TK_STRING, &X.name, 1);
+  ExprList *pList = sqlite3ExprListAppend(pParse, 0, pAttrName);
+  pList = sqlite3ExprListAppend(pParse, pList, X.value);
+  A = sqlite3ExprFunction(pParse, pList, &jsonObjFunc, 0);
+}
+
+jsx_attributes(A) ::= jsx_attributes(X) jsx_attribute(Y). {
+  // Merge attributes using json_patch
+  Token jsonPatchFunc;
+  jsonPatchFunc.z = "json_patch";
+  jsonPatchFunc.n = 10;
+  
+  Token jsonObjFunc;
+  jsonObjFunc.z = "json_object";
+  jsonObjFunc.n = 11;
+  
+  Expr *pAttrName = sqlite3ExprAlloc(pParse->db, TK_STRING, &Y.name, 1);
+  ExprList *pList = sqlite3ExprListAppend(pParse, 0, pAttrName);
+  pList = sqlite3ExprListAppend(pParse, pList, Y.value);
+  Expr *pNewAttr = sqlite3ExprFunction(pParse, pList, &jsonObjFunc, 0);
+  
+  ExprList *pPatchList = sqlite3ExprListAppend(pParse, 0, X);
+  pPatchList = sqlite3ExprListAppend(pParse, pPatchList, pNewAttr);
+  A = sqlite3ExprFunction(pParse, pPatchList, &jsonPatchFunc, 0);
+}
+
+jsx_expr(A) ::= expr(A).
+
+jsx_attribute(A) ::= id(X) EQ STRING(Y). {
+  A.name = X;
+  A.value = sqlite3ExprAlloc(pParse->db, TK_STRING, &Y, 1);
+}
+
+jsx_attribute(A) ::= id(X) EQ LBRACE jsx_expr(Y) RBRACE. {
+  A.name = X;
+  A.value = Y;
+}
+
+jsx_attribute(A) ::= id(X). {
+  A.name = X;
+  Token trueToken;
+  trueToken.z = "true";
+  trueToken.n = 4;
+  A.value = sqlite3ExprAlloc(pParse->db, TK_STRING, &trueToken, 1);
+}
+
+jsx_item(A) ::= LT id(X) jsx_attributes(Y) GT jsx_content(Z) LT SLASH id GT. {
+  A = makeJSXElement(pParse, &X, Y, Z);
+}
+
+jsx_item(A) ::= LT id(X) jsx_attributes(Y) GT LT SLASH id GT. {
+  Token jsonArray = { "json_array", 10 };
+  Expr *pChildren = sqlite3ExprFunction(pParse, 0, &jsonArray, 0);
+  A = makeJSXElement(pParse, &X, Y, pChildren);
+}
+
+jsx_item(A) ::= LT id(X) jsx_attributes(Y) SLASH GT. {
+  Expr *pChildren = sqlite3ExprAlloc(pParse->db, TK_NULL, 0, 0);
+  A = makeJSXElement(pParse, &X, Y, pChildren);
+}
+
+expr(A) ::= jsx_item(X). {
+  A = X;
+}

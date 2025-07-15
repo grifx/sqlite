@@ -57,6 +57,8 @@
 #define CC_ILLEGAL   28    /* Illegal character */
 #define CC_NUL       29    /* 0x00 */
 #define CC_BOM       30    /* First byte of UTF8 BOM:  0xEF 0xBB 0xBF */
+#define CC_LBRACE    31    /* '{' */
+#define CC_RBRACE    32    /* '}' */
 
 static const unsigned char aiClass[] = {
 #ifdef SQLITE_ASCII
@@ -68,7 +70,7 @@ static const unsigned char aiClass[] = {
 /* 4x */    5,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
 /* 5x */    1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2,  9, 28, 28, 28,  2,
 /* 6x */    8,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
-/* 7x */    1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2, 28, 10, 28, 25, 28,
+/* 7x */    1,  1,  1,  1,  1,  1,  1,  1,  0,  2,  2, 31, 10, 32, 25, 28,
 /* 8x */   27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
 /* 9x */   27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
 /* Ax */   27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
@@ -92,8 +94,8 @@ static const unsigned char aiClass[] = {
 /* 9x */   28,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28,
 /* Ax */   28, 25,  1,  1,  1,  1,  1,  0,  2,  2, 28, 28, 28, 28, 28, 28,
 /* Bx */   28, 28, 28, 28, 28, 28, 28, 28, 28, 28,  9, 28, 28, 28, 28, 28,
-/* Cx */   28,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28,
-/* Dx */   28,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28,
+/* Cx */   31,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28,
+/* Dx */   32,  1,  1,  1,  1,  1,  1,  1,  1,  1, 28, 28, 28, 28, 28, 28,
 /* Ex */   28, 28,  1,  1,  1,  1,  1,  0,  2,  2, 28, 28, 28, 28, 28, 28,
 /* Fx */    3,  3,  3,  3,  3,  3,  3,  3,  3,  3, 28, 28, 28, 28, 28, 28,
 #endif
@@ -266,12 +268,121 @@ static int analyzeFilterKeyword(const unsigned char *z, int lastToken){
 }
 #endif /* SQLITE_OMIT_WINDOWFUNC */
 
+static int jsxElementDepth = 0;
+static int jsxExpressionDepth = 0;
+static int jsxAttributeMode = 0;
+static int jsxLastTokenType = -1;
+static int jsxInClosingTag = 0;
+
+
+static void resetJSXContext(void) {
+  jsxElementDepth = 0;
+  jsxExpressionDepth = 0;
+  jsxAttributeMode = 0;
+  jsxLastTokenType = -1;
+  jsxInClosingTag = 0;
+}
+
+static int isInJSXContext(void){
+  return (jsxElementDepth > 0 && jsxExpressionDepth == 0 && !jsxAttributeMode);
+}
+
+static void updateJSXContext(int tokenType, const char *tokenText, int tokenLen){
+  
+  if( jsxLastTokenType == TK_LT && tokenType == TK_ID && !jsxInClosingTag ){
+    jsxElementDepth++;
+    jsxAttributeMode = 1;
+  }
+  
+  switch( tokenType ){
+    case TK_GT:
+        if( jsxElementDepth > 0 ){
+          if( jsxLastTokenType == TK_SLASH ){
+            jsxElementDepth--;
+          } else if( jsxAttributeMode ){
+            // noop
+          } else if( jsxInClosingTag ){
+             jsxElementDepth--;
+             jsxInClosingTag = 0;
+           }
+           jsxAttributeMode = 0;
+        }
+        break;
+    case TK_SLASH:
+      if( jsxLastTokenType == TK_LT ){
+        jsxInClosingTag = 1;
+      } else if( jsxAttributeMode && jsxElementDepth > 0 ){}
+      break;
+    case TK_LBRACE:
+      if( jsxElementDepth > 0 ){
+        jsxExpressionDepth++;
+      }
+      break;
+    case TK_RBRACE:
+      if( jsxElementDepth > 0 && jsxExpressionDepth > 0 ){
+        jsxExpressionDepth--;
+      }
+      break;
+    case TK_STRING:
+      break;
+    case TK_EQ:
+      break;
+  }
+  
+  jsxLastTokenType = tokenType;
+}
+
+static int collectJSXText(const unsigned char *z, int *tokenType){
+  int i = 0;
+  
+  if( jsxInClosingTag ) return 0;
+  
+  if( jsxLastTokenType == TK_LT ) return 0;
+  
+  if(
+    !isInJSXContext() &&
+    !(jsxElementDepth > 0 && jsxExpressionDepth == 0 && !jsxAttributeMode && !jsxInClosingTag)
+  ) return 0;
+  
+  if( z[0]=='{' || z[0]=='<' || z[0]==0 ) return 0;
+  
+  while( z[i] ){
+    if( z[i]=='{' || z[i]=='<' ) break;
+    if( z[i]=='<' && z[i+1] && z[i+1]=='/' ) break;
+    i++;
+  }
+  
+  while( i > 0 && sqlite3Isspace(z[i-1]) ){
+    i--;
+  }
+  
+  if( i > 0 ){
+    int hasNonSpace = 0;
+    int j;
+    for( j = 0; j < i; j++ ){
+      if( !sqlite3Isspace(z[j]) ){
+        hasNonSpace = 1;
+        break;
+      }
+    }
+    
+    if( hasNonSpace ){
+      *tokenType = TK_JSX_TEXT;
+      return i;
+    }
+  }
+  
+  return 0;
+}
+
 /*
 ** Return the length (in bytes) of the token that begins at z[0]. 
 ** Store the token type in *tokenType before returning.
 */
 int sqlite3GetToken(const unsigned char *z, int *tokenType){
   int i, c;
+  
+
   switch( aiClass[*z] ){  /* Switch on the character-class of the first byte
                           ** of the token. See the comment on the CC_ defines
                           ** above. */
@@ -340,6 +451,7 @@ int sqlite3GetToken(const unsigned char *z, int *tokenType){
         *tokenType = TK_LE;
         return 2;
       }else if( c=='>' ){
+        // Regular not-equal operator
         *tokenType = TK_NE;
         return 2;
       }else if( c=='<' ){
@@ -363,6 +475,12 @@ int sqlite3GetToken(const unsigned char *z, int *tokenType){
       }
     }
     case CC_BANG: {
+      // First check if this could be JSX text content
+      int jsxTextLen = collectJSXText(z, tokenType);
+      if( jsxTextLen > 0 ){
+        return jsxTextLen;
+      }
+      
       if( z[1]!='=' ){
         *tokenType = TK_ILLEGAL;
         return 1;
@@ -392,6 +510,14 @@ int sqlite3GetToken(const unsigned char *z, int *tokenType){
       *tokenType = TK_BITNOT;
       return 1;
     }
+    case CC_LBRACE: {
+      *tokenType = TK_LBRACE;
+      return 1;
+    }
+    case CC_RBRACE: {
+      *tokenType = TK_RBRACE;
+      return 1;
+    }
     case CC_QUOTE: {
       int delim = z[0];
       testcase( delim=='`' );
@@ -407,6 +533,9 @@ int sqlite3GetToken(const unsigned char *z, int *tokenType){
         }
       }
       if( c=='\'' ){
+        *tokenType = TK_STRING;
+        return i+1;
+      }else if( c=='"' ){
         *tokenType = TK_STRING;
         return i+1;
       }else if( c!=0 ){
@@ -536,16 +665,21 @@ int sqlite3GetToken(const unsigned char *z, int *tokenType){
       return i;
     }
     case CC_KYWD0: {
+      int jsxTextLen = collectJSXText(z, tokenType);
+
+      if( jsxTextLen > 0 ) return jsxTextLen;
+      
       if( aiClass[z[1]]>CC_KYWD ){ i = 1;  break; }
       for(i=2; aiClass[z[i]]<=CC_KYWD; i++){}
+      
       if( IdChar(z[i]) ){
-        /* This token started out using characters that can appear in keywords,
-        ** but z[i] is a character not allowed within keywords, so this must
-        ** be an identifier instead */
         i++;
         break;
       }
       *tokenType = TK_ID;
+      
+      if( jsxLastTokenType == TK_LT || jsxLastTokenType == TK_SLASH ) return i;
+      
       return keywordCode((char*)z, i, tokenType);
     }
     case CC_X: {
@@ -568,6 +702,10 @@ int sqlite3GetToken(const unsigned char *z, int *tokenType){
     }
     case CC_KYWD:
     case CC_ID: {
+      int jsxTextLen = collectJSXText(z, tokenType);
+      if( jsxTextLen > 0 ){
+        return jsxTextLen;
+      }
       i = 1;
       break;
     }
@@ -590,6 +728,9 @@ int sqlite3GetToken(const unsigned char *z, int *tokenType){
   }
   while( IdChar(z[i]) ){ i++; }
   *tokenType = TK_ID;
+  
+  if( jsxLastTokenType == TK_LT ) return i;
+  
   return i;
 }
 
@@ -617,6 +758,9 @@ int sqlite3RunParser(Parse *pParse, const char *zSql){
   }
   pParse->rc = SQLITE_OK;
   pParse->zTail = zSql;
+  
+  /* Reset JSX context at the start of each SQL statement */
+  resetJSXContext();
 #ifdef SQLITE_DEBUG
   if( db->flags & SQLITE_ParserTrace ){
     printf("parser: [[[%s]]]\n", zSql);
@@ -641,8 +785,13 @@ int sqlite3RunParser(Parse *pParse, const char *zSql){
   assert( pParse->pVList==0 );
   pParentParse = db->pParse;
   db->pParse = pParse;
+  
   while( 1 ){
     n = sqlite3GetToken((u8*)zSql, &tokenType);
+    
+    
+    /* Update JSX context based on the current token */
+    updateJSXContext(tokenType, (const char*)zSql, n);
     mxSqlLen -= n;
     if( mxSqlLen<0 ){
       pParse->rc = SQLITE_TOOBIG;

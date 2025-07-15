@@ -1,0 +1,5 @@
+{
+  // No format on save
+  "editor.formatOnSave": false,
+  "files.trimTrailingWhitespace": false,
+}
