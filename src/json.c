@@ -4717,6 +4717,142 @@ static void jsonErrorFunc(
   }
 }
 
+typedef struct JsonbBuffer {
+  u8 *aData;
+  u32 nUsed;
+  u32 nAlloc;
+  sqlite3 *db;
+} JsonbBuffer;
+
+static void jsonbJsonbGroupArrayStep(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  JsonbBuffer *pBuf = (JsonbBuffer*)sqlite3_aggregate_context(ctx, sizeof(JsonbBuffer));
+
+  if( pBuf==0 ) return;
+
+  if( pBuf->aData==0 ){
+    memset(pBuf, 0, sizeof(JsonbBuffer));
+    pBuf->db = sqlite3_context_db_handle(ctx);
+  }
+
+  if( argc == 0 ) return;
+
+  sqlite3_value *pValue = argv[0];
+  int valueType = sqlite3_value_type(pValue);
+
+  if( valueType==SQLITE_BLOB ){
+    const u8 *zBlob = sqlite3_value_blob(pValue);
+    int nBlob = sqlite3_value_bytes(pValue);
+
+    if( zBlob && nBlob>0 ){
+      if( pBuf->nUsed + nBlob > pBuf->nAlloc ){
+        u32 newSize = pBuf->nAlloc;
+        if( newSize==0 ) newSize = 256;
+        while( newSize < pBuf->nUsed + nBlob ) newSize *= 2;
+
+        u8 *newData = sqlite3_realloc64(pBuf->aData, newSize);
+        if( !newData ){
+          sqlite3_result_error_nomem(ctx);
+          return;
+        }
+
+        pBuf->aData = newData;
+        pBuf->nAlloc = newSize;
+      }
+
+      memcpy(&pBuf->aData[pBuf->nUsed], zBlob, nBlob);
+      pBuf->nUsed += nBlob;
+    }
+    return;
+  }
+  
+  if( valueType==SQLITE_TEXT /* might be JSONB with lost subtype */ ){
+    JsonParse temp;
+    if(!jsonArgIsJsonb(pValue, &temp) ) return;
+
+    if( temp.aBlob && temp.nBlob > 0 ){
+      if( pBuf->nUsed + temp.nBlob > pBuf->nAlloc ){
+        u32 newSize = pBuf->nAlloc;
+        if( newSize==0 ) newSize = 256;
+        while( newSize < pBuf->nUsed + temp.nBlob ) newSize *= 2;
+
+        u8 *newData = sqlite3_realloc64(pBuf->aData, newSize);
+        if( !newData ){
+          sqlite3_result_error_nomem(ctx);
+          return;
+        }
+
+        pBuf->aData = newData;
+        pBuf->nAlloc = newSize;
+      }
+
+      memcpy(&pBuf->aData[pBuf->nUsed], temp.aBlob, temp.nBlob);
+      pBuf->nUsed += temp.nBlob;
+    }
+  }
+}
+
+static void computeJsonbJsonbGroupArray(sqlite3_context *ctx, int isFinal){
+  JsonbBuffer *pBuf = (JsonbBuffer*)sqlite3_aggregate_context(ctx, 0);
+  
+  if( pBuf==0 || pBuf->nUsed==0 ){
+    static const u8 empty[] = { JSONB_ARRAY };
+    sqlite3_result_blob(ctx, empty, sizeof(empty), SQLITE_STATIC);
+    sqlite3_result_subtype(ctx, JSON_SUBTYPE);
+    return;
+  }
+
+  u32 headerSize;
+  if( pBuf->nUsed <= 11 ){
+    headerSize = 1;
+  } else if( pBuf->nUsed <= 255 ){
+    headerSize = 2;
+  } else if( pBuf->nUsed <= 65535 ){
+    headerSize = 3;
+  } else {
+    headerSize = 5;
+  }
+
+  u32 totalSize = headerSize + pBuf->nUsed;
+  u8 *result = sqlite3_malloc64(totalSize);
+  if( !result ){
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+
+  if( pBuf->nUsed <= 11 ){
+    result[0] = JSONB_ARRAY | (pBuf->nUsed << 4);
+  } else if( pBuf->nUsed <= 255 ){
+    result[0] = JSONB_ARRAY | 0xc0;
+    result[1] = (u8)pBuf->nUsed;
+  } else if( pBuf->nUsed <= 65535 ){
+    result[0] = JSONB_ARRAY | 0xd0;
+    result[1] = (pBuf->nUsed >> 8) & 0xff;
+    result[2] = pBuf->nUsed & 0xff;
+  } else {
+    result[0] = JSONB_ARRAY | 0xe0;
+    result[1] = (pBuf->nUsed >> 24) & 0xff;
+    result[2] = (pBuf->nUsed >> 16) & 0xff;
+    result[3] = (pBuf->nUsed >> 8) & 0xff;
+    result[4] = pBuf->nUsed & 0xff;
+  }
+
+  memcpy(result + headerSize, pBuf->aData, pBuf->nUsed);
+
+  sqlite3_result_blob(ctx, result, totalSize, SQLITE_TRANSIENT);
+  sqlite3_result_subtype(ctx, JSON_SUBTYPE);
+  sqlite3_free(result);
+
+  if( isFinal && pBuf->aData ) sqlite3_free(pBuf->aData);
+}
+
+static void jsonbJsonbGroupArrayFinal(sqlite3_context *ctx){
+  computeJsonbJsonbGroupArray(ctx, 1);
+}
+
+static void jsonbJsonbGroupArrayValue(sqlite3_context *ctx){
+  computeJsonbJsonbGroupArray(ctx, 0);
+}
+
 /****************************************************************************
 ** Aggregate SQL function implementations
 ****************************************************************************/
@@ -5569,6 +5705,11 @@ void sqlite3RegisterJsonFunctions(void){
        SQLITE_DETERMINISTIC),
     WAGGREGATE(jsonb_group_array, 1, JSON_BLOB, 0,
        jsonArrayStep, jsonArrayFinal, jsonArrayValue, jsonGroupInverse,
+       SQLITE_SUBTYPE|SQLITE_RESULT_SUBTYPE|SQLITE_UTF8|SQLITE_DETERMINISTIC),
+    WAGGREGATE(
+       jsonb_jsonb_group_array,   1, JSON_BLOB, 0,
+       jsonbJsonbGroupArrayStep, jsonbJsonbGroupArrayFinal, jsonbJsonbGroupArrayValue,
+       jsonGroupInverse,
        SQLITE_SUBTYPE|SQLITE_RESULT_SUBTYPE|SQLITE_UTF8|SQLITE_DETERMINISTIC),
     WAGGREGATE(json_group_object, 2, 0, 0,
        jsonObjectStep, jsonObjectFinal, jsonObjectValue, jsonGroupInverse,
